@@ -126,12 +126,34 @@ def post_sale_stock(db, order, items: list[OrderItem], warehouse_id: str, user=N
                               doc_id=order.id, reason=f"Продажа, заказ №{order.number}", user=user)
             except HTTPException as e:
                 # фиксируем нехватку, но не блокируем оплату: списываем с разрешением минуса и причиной
+                allow_neg = _allow_negative_sales(db)
+                if not allow_neg:
+                    raise
                 post_movement(db, warehouse_id=wh, product_id=pid, qty_signed=-qn, doc_type="sale",
-                              doc_id=order.id, reason=f"Продажа (нехватка): {e.detail}", user=user,
-                              negative_allowed=True)
+                              doc_id=order.id, reason=f"Продажа (нехватка, минус разрешён настройкой): {e.detail}",
+                              user=user, negative_allowed=True)
                 log_event(db, user=user, event_type="stock.negative", object_type="product", object_id=pid,
                           venue_id=order.venue_id, amount=float(line_cost), reason=str(e.detail))
         total_cost += line_cost
     order.cost_amount = money(total_cost)
     order.stock_posted = True
     return money(total_cost)
+
+def _allow_negative_sales(db) -> bool:
+    """Разрешение уходить в минус при списании продаж — только явной настройкой (по умолчанию запрещено)."""
+    from ..models import Setting
+
+    def truthy(v):
+        return bool(v) if isinstance(v, bool) else str(v).lower() in ("1", "true")
+
+    st = db.get(Setting, "stock.allow_negative_sales")
+    if st is not None:
+        val = st.value
+        if isinstance(val, dict):
+            return truthy(val.get("value", False))
+        return truthy(val)
+    # совместимо с настройкой админ-панели negative_stock_policy {"allow_on_sales": true}
+    st2 = db.get(Setting, "negative_stock_policy")
+    if st2 is not None and isinstance(st2.value, dict):
+        return truthy(st2.value.get("allow_on_sales", False))
+    return False

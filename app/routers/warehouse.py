@@ -11,7 +11,7 @@ from ..models import (Warehouse, Product, StockBalance, StockMovement, StockLot,
 from ..services.audit import log_event
 from ..services.stock_service import post_movement, get_balance
 
-router = APIRouter(tags=["warehouse"])
+router = APIRouter(prefix="/warehouse", tags=["warehouse"])
 
 
 class ProductIn(BaseModel):
@@ -128,7 +128,8 @@ def movements(product_id: Optional[str] = None, warehouse_id: Optional[str] = No
     if date_to: q = q.filter(StockMovement.at <= date_to + " 23:59:59")
     rows = q.order_by(StockMovement.at.desc()).limit(limit).all()
     return [{"at": m.at.isoformat(sep=" ", timespec="seconds"), "product": db.get(Product, m.product_id).name,
-             "qty": float(m.qty_signed), "doc_type": m.doc_type, "doc_id": m.doc_id, "reason": m.reason,
+             "qty": float(m.qty_signed), "qty_signed": float(m.qty_signed),
+             "doc_type": m.doc_type, "doc_id": m.doc_id, "reason": m.reason,
              "unit_cost": float(m.unit_cost), "negative_allowed": m.negative_allowed,
              "user": (db.get(User, m.user_id).name if m.user_id and db.get(User, m.user_id) else "")}
             for m in rows]

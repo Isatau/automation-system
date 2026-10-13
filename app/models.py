@@ -314,6 +314,8 @@ class OrderItem(Base, TimestampMixin):
     cancel_reason: Mapped[Optional[str]] = mapped_column(Text)
     comment: Mapped[Optional[str]] = mapped_column(String(300))
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)   # soft-delete с историей
+    locked: Mapped[bool] = mapped_column(Boolean, default=False)    # позиция закреплена за сотрудником (конкурентная правка)
+    locked_by: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
     split_id: Mapped[Optional[str]] = mapped_column(ForeignKey("order_splits.id"))
 
 

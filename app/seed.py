@@ -8,8 +8,15 @@ from .models import (Venue, CashRegister, Hall, Table, User, PaymentMethod, Stat
 def seed_all(force=False):
     db = SessionLocal()
     try:
-        if db.query(Venue).count() and not force:
-            return
+        if db.query(Venue).count():
+            if not force:
+                return
+            # полный пересозид (используется тестами): удаляем ВСЕ таблицы метаданных,
+            # иначе уникальные индексы (users.login, orders.number) не позволят seeded ещё раз
+            from .db import Base
+            for t in reversed(Base.metadata.sorted_tables):
+                db.execute(t.delete())
+            db.commit()
         pwd = os.environ.get("RESTOCORE_ADMIN_PASSWORD", "admin123")
         v = Venue(name="Ресторан «Демотест»", address="Алматы, пр. Абая 1", currency="KZT")
         db.add(v); db.flush()
