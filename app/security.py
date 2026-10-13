@@ -8,16 +8,36 @@ from fastapi import Depends, HTTPException, Header
 from .config import settings
 from .db import now_almaty, SessionLocal
 
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+try:  # passlib+старый bcrypt могут падать на детекте бага >72 байт
+    from passlib.context import CryptContext
+    pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    pwd_ctx.hash("compat-probe")
+except Exception:
+    pwd_ctx = None
+
+if pwd_ctx is not None:
+    def _hash(p: str) -> str:
+        return pwd_ctx.hash(p[:72])
+    def _verify(p: str, h: str) -> bool:
+        try:
+            return pwd_ctx.verify(p[:72], h)
+        except ValueError:
+            return False
+else:
+    import bcrypt as _bc
+    def _hash(p: str) -> str:
+        return _bc.hashpw(p.encode()[:72], _bc.gensalt(rounds=12)).decode()
+    def _verify(p: str, h: str) -> bool:
+        try:
+            return _bc.checkpw(p.encode()[:72], h.encode())
+        except ValueError:
+            return False
 
 def hash_password(p: str) -> str:
-    return pwd_ctx.hash(p)
+    return _hash(p)
 
 def verify_password(p: str, h: str) -> bool:
-    try:
-        return pwd_ctx.verify(p, h)
-    except ValueError:
-        return False
+    return _verify(p, h)
 
 def make_token(user_id: str, role: str) -> tuple[str, str, datetime]:
     jti = uuid.uuid4().hex

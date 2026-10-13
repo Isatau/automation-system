@@ -12,7 +12,7 @@ from ..models import (MenuItem, MenuCategory, ModifierGroup, Modifier, Recipe, R
 from ..services.audit import log_event
 from ..services.stock_service import dish_cost
 
-router = APIRouter(tags=["menu"])
+router = APIRouter(prefix="/menu", tags=["menu"])
 
 
 def _item_out(it: MenuItem, db: Session, with_cost=False):

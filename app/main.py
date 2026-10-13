@@ -100,25 +100,29 @@ async def _bg_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Схема: Alembic при наличии миграций; иначе create_all (dev/тесты).
+    # Схема: Alembic. Если в БД уже есть таблицы вне alembic_version (например,
+    # тесты создали их через create_all), сначала ставим baseline-метку, затем upgrade head.
     try:
         from alembic.config import Config as AConfig
         from alembic import command
-        cfg = AConfig(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
-        cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "migrations"))
+        from sqlalchemy import inspect as sa_inspect
+        root = os.path.join(os.path.dirname(__file__), "..")
+        cfg = AConfig(os.path.join(root, "alembic.ini"))
+        cfg.set_main_option("script_location", os.path.join(root, "migrations"))
         cfg.set_main_option("sqlalchemy.url", settings.database_url)
-        command.upgrade(cfg, "head")
+        insp = sa_inspect(engine)
+        tables = set(insp.get_table_names())
+        if tables and "alembic_version" not in tables:
+            command.stamp(cfg, "head")   # существующая схема = актуальная версия моделей
+        else:
+            command.upgrade(cfg, "head")
     except Exception as e:
         print(f"[startup] Alembic недоступен ({e}); создаю схему через metadata.create_all")
         Base.metadata.create_all(bind=engine)
     if settings.seed_demo:
         try:
-            from .seed import seed_if_empty
-            db = SessionLocal()
-            try:
-                seed_if_empty(db)
-            finally:
-                db.close()
+            from .seed import seed_all
+            seed_all(force=False)       # идемпотентно: пропускает, если данные уже есть
         except Exception as e:
             print(f"[startup] seed: {e}")
     task = asyncio.create_task(_bg_loop())

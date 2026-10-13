@@ -74,6 +74,7 @@ class ItemIn(BaseModel):
     comment: Optional[str] = None
     split_id: Optional[str] = None
     course: int = 1
+    version: Optional[int] = None   # optimistic locking при добавлении
 
 
 class ItemPatch(BaseModel):
@@ -93,8 +94,8 @@ def create_order(body: CreateIn, user: User = Depends(require_perm("orders:creat
         venue_id = v.id if v else None
     if not venue_id:
         raise HTTPException(400, "Не задано заведение")
-    last = db.query(Order).with_entities(Order.number).order_by(Order.number.desc()).first()
-    number = (last[0] or 1000) + 1
+    last = db.query(Order.number).order_by(Order.number.desc()).first()
+    number = ((last[0] if last else None) or 1000) + 1
     shift = db.query(Shift).filter(Shift.status == "open").first()
     o = Order(number=number, venue_id=venue_id, status="open",
               table_id=body.table_id, waiter_id=body.waiter_id or user.id,
@@ -148,8 +149,11 @@ def add_item(oid: str, body: ItemIn, user: User = Depends(require_perm("orders:c
     if not mi or mi.archived: raise HTTPException(400, "Позиция меню не найдена")
     if mi.unavailable_until and mi.unavailable_until > now_almaty():
         raise HTTPException(409, f"«{mi.name}» временно снят с продажи")
+    if body.version is not None and body.version != o.version:
+        raise HTTPException(409, "Заказ изменён другим сотрудником — обновите данные")
     oi = OrderItem(order_id=o.id, item_id=mi.id, name_snapshot=mi.name, qty=body.qty,
-                   unit_price=mi.price, comment=body.comment, course=body.course, split_id=body.split_id)
+                   unit_price=mi.price, comment=body.comment, course=body.course, split_id=body.split_id,
+                   locked=True, locked_by=user.id)
     mods_total = Decimal("0")
     db.add(oi); db.flush()
     for mid in body.modifiers:
@@ -161,6 +165,7 @@ def add_item(oid: str, body: ItemIn, user: User = Depends(require_perm("orders:c
     oi.mods_total = money(mods_total)
     if o.status == "created": o.status = "open"
     full_recalc(db, o)
+    o.version += 1
     log_event(db, user=user, event_type="order.item_added", object_type="order", object_id=o.id,
               venue_id=o.venue_id, new_values={"item": mi.name, "qty": body.qty}, amount=float(oi.line_total))
     db.commit()
@@ -172,13 +177,16 @@ def add_item(oid: str, body: ItemIn, user: User = Depends(require_perm("orders:c
 @router.patch("/items/{item_id}")
 def patch_item(item_id: str, body: ItemPatch, user: User = Depends(require_perm("orders:edit")),
                db: Session = Depends(get_db)):
-    oi = db.get(OrderItem, item_id)
+    oi = (db.query(OrderItem).filter(OrderItem.id == item_id).with_for_update().first())
     if not oi: raise HTTPException(404, "Позиция не найдена")
-    o = db.get(Order, oi.order_id)
+    o = (db.query(Order).filter(Order.id == oi.order_id).with_for_update().first())
     if o.status in ("closed", "cancelled", "paid"):
         raise HTTPException(409, "Заказ закрыт/оплачен — изменение невозможно")
     if body.version is not None and body.version != o.version:
         raise HTTPException(409, "Заказ изменён другим сотрудником — обновите данные")
+    if oi.locked and oi.locked_by and oi.locked_by != user.id and user.role not in ("owner", "manager", "shift_admin"):
+        raise HTTPException(409, "Позиция редактируется другим сотрудником (заблокирована)")
+    oi.locked = True; oi.locked_by = user.id
     old = {"qty": float(oi.qty), "price": float(oi.unit_price), "discount_pct": float(oi.discount_pct)}
     if body.qty is not None:
         oi.qty = body.qty
@@ -213,11 +221,13 @@ def delete_item(item_id: str, reason: str = "", user: User = Depends(require_per
                 db: Session = Depends(get_db)):
     if not reason.strip():
         raise HTTPException(400, "Укажите причину удаления позиции")
-    oi = db.get(OrderItem, item_id)
+    oi = (db.query(OrderItem).filter(OrderItem.id == item_id).with_for_update().first())
     if not oi: raise HTTPException(404, "Позиция не найдена")
-    o = db.get(Order, oi.order_id)
+    o = (db.query(Order).filter(Order.id == oi.order_id).with_for_update().first())
     if o.status in ("closed", "cancelled", "paid"):
         raise HTTPException(409, "Заказ закрыт/оплачен — удаление невозможно")
+    if oi.locked and oi.locked_by and oi.locked_by != user.id and user.role not in ("owner", "manager", "shift_admin"):
+        raise HTTPException(409, "Позиция редактируется другим сотрудником (заблокирована)")
     if oi.status in ("sent", "cooking", "ready"):
         # отмена после передачи на кухню — с сохранением истории и событием для KDS
         oi.status = "cancelled"; oi.cancel_reason = reason
@@ -467,5 +477,52 @@ def close_order(oid: str, user: User = Depends(require_perm("payments:create")),
         t = db.get(Table, o.table_id)
         if t: t.status = "cleaning"
     log_event(db, user=user, event_type="order.closed", object_type="order", object_id=o.id, amount=float(o.total))
+    db.commit()
+    return _order_out(o, active_items(db, o.id), db)
+
+class UnlockIn(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.post("/items/{item_id}/unlock")
+def unlock_item(item_id: str, body: UnlockIn, user: User = Depends(require_perm("orders:edit")),
+                db: Session = Depends(get_db)):
+    """Снять блокировку позиции (например, сотрудник закрыл карточку не сохранив)."""
+    oi = db.get(OrderItem, item_id)
+    if not oi: raise HTTPException(404, "Позиция не найдена")
+    if oi.locked_by and oi.locked_by != user.id and user.role not in ("owner", "manager", "shift_admin"):
+        raise HTTPException(403, "Разблокировать чужую позицию может только руководитель")
+    oi.locked = False; oi.locked_by = None
+    log_event(db, user=user, event_type="order.item_unlocked", object_type="order_item", object_id=oi.id,
+              reason=body.reason)
+    db.commit()
+    return {"ok": True}
+
+
+class OrderPatchIn(BaseModel):
+    version: int
+    waiter_id: Optional[str] = None
+    guest_id: Optional[str] = None
+    comment: Optional[str] = None
+
+
+@router.patch("/{oid}")
+def patch_order(oid: str, body: OrderPatchIn, user: User = Depends(require_perm("orders:edit")),
+                db: Session = Depends(get_db)):
+    """Обновление шапки заказа с обязательной версией (optimistic locking)."""
+    o = (db.query(Order).filter(Order.id == oid).with_for_update().first())
+    if not o: raise HTTPException(404, "Заказ не найден")
+    if o.status in ("closed", "cancelled", "paid"):
+        raise HTTPException(409, "Заказ завершён — изменение невозможно")
+    if body.version != o.version:
+        raise HTTPException(409, "Заказ изменён другим сотрудником — обновите данные")
+    old = {"waiter_id": o.waiter_id, "guest_id": o.guest_id, "comment": o.comment}
+    if body.waiter_id: o.waiter_id = body.waiter_id
+    if body.guest_id: o.guest_id = body.guest_id
+    if body.comment is not None: o.comment = body.comment
+    o.version += 1
+    log_event(db, user=user, event_type="order.updated", object_type="order", object_id=o.id,
+              venue_id=o.venue_id, old_values=old, new_values={"waiter_id": o.waiter_id,
+              "guest_id": o.guest_id, "comment": o.comment})
     db.commit()
     return _order_out(o, active_items(db, o.id), db)
