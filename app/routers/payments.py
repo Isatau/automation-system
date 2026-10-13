@@ -7,7 +7,7 @@ from typing import Optional
 from ..deps import get_db, require_perm
 from ..db import now_almaty, money, SessionLocal
 from ..models import (Order, Payment, Refund, PaymentMethod, Shift, OrderSplit, User, Guest,
-                      GiftCertificate, CashOperation, FinTransaction, FinancialAccount,
+                      GiftCertificate, CertificateOperation, CashOperation, FinTransaction, FinancialAccount,
                       DiscountRule, DepositAccount, Warehouse)
 from ..routers.orders import active_items
 from ..services.audit import log_event
@@ -95,6 +95,8 @@ def pay_order(oid: str, body: PayIn, user: User = Depends(require_perm("payments
         use = min(amt, Decimal(str(cert.balance)))
         if use <= 0: raise HTTPException(409, "На сертификате нет средств")
         cert.balance = money(Decimal(str(cert.balance)) - use)
+        db.add(CertificateOperation(certificate_id=cert.id, order_id=o.id, amount=use,
+                                   balance_after=cert.balance, by_user=user.id))
         if cert.balance == 0:
             cert.status = "used"; cert.used_by_order = o.id
         amt = money(use)
