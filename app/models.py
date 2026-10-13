@@ -449,6 +449,17 @@ class GiftCertificate(Base, TimestampMixin):
     used_by_order: Mapped[Optional[str]] = mapped_column(ForeignKey("orders.id"))
 
 
+class CertificateOperation(Base, TimestampMixin):
+    """История использования сертификатов (полный аудит; повторное использование исключено)."""
+    __tablename__ = "certificate_operations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    certificate_id: Mapped[str] = mapped_column(ForeignKey("gift_certificates.id"), index=True)
+    order_id: Mapped[Optional[str]] = mapped_column(ForeignKey("orders.id"))
+    amount: Mapped[float] = mapped_column(Money)
+    balance_after: Mapped[float] = mapped_column(Money)
+    by_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+
+
 class SaleDiscount(Base, TimestampMixin):
     """Каждое применение скидки — запись с причиной и подтверждением."""
     __tablename__ = "sale_discounts"
@@ -573,3 +584,304 @@ class Setting(Base, TimestampMixin):
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     venue_id: Mapped[Optional[str]] = mapped_column(ForeignKey("venues.id"))
     value = mapped_column(JSONText, default=dict)
+
+
+# ---------------- Платежи, возвраты, смены ----------------
+
+PAYMENT_STATUSES = ["confirmed", "reversed", "pending"]
+
+
+class PaymentMethod(Base, TimestampMixin):
+    __tablename__ = "payment_methods"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    code: Mapped[str] = mapped_column(String(30), unique=True)   # cash|card|qr|deposit|certificate|bonus|mixed|other
+    name: Mapped[str] = mapped_column(String(100))
+    is_cash: Mapped[bool] = mapped_column(Boolean, default=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class Shift(Base, TimestampMixin):
+    __tablename__ = "shifts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"), index=True)
+    register_id: Mapped[str] = mapped_column(ForeignKey("cash_registers.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    status: Mapped[str] = mapped_column(String(15), default="open", index=True)  # open|closed
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: now_almaty_ref())
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    initial_cash: Mapped[float] = mapped_column(Money, default=0)
+    expected_cash: Mapped[Optional[float]] = mapped_column(Money)
+    actual_cash: Mapped[Optional[float]] = mapped_column(Money)
+    difference: Mapped[Optional[float]] = mapped_column(Money)
+    closed_by: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    reopen_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Payment(Base, TimestampMixin):
+    __tablename__ = "payments"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"), index=True)
+    shift_id: Mapped[Optional[str]] = mapped_column(ForeignKey("shifts.id"), index=True)
+    split_id: Mapped[Optional[str]] = mapped_column(ForeignKey("order_splits.id"))
+    method: Mapped[str] = mapped_column(String(30), index=True)
+    amount: Mapped[float] = mapped_column(Money)
+    tip: Mapped[float] = mapped_column(Money, default=0)
+    status: Mapped[str] = mapped_column(String(15), default="confirmed", index=True)  # confirmed|reversed|pending
+    refunded_amount: Mapped[float] = mapped_column(Money, default=0)
+    guest_id: Mapped[Optional[str]] = mapped_column(ForeignKey("guests.id"))
+    by_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    card_mask: Mapped[Optional[str]] = mapped_column(String(19))   # только mask PAN (****1234); полные данные не хранятся
+    auth_code: Mapped[Optional[str]] = mapped_column(String(40))
+    external_ref: Mapped[Optional[str]] = mapped_column(String(80))
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(120), unique=True)
+    fiscal_state: Mapped[str] = mapped_column(String(15), default="none")  # none|pending|done|failed
+    fiscal_receipt_no: Mapped[Optional[str]] = mapped_column(String(60))
+
+
+class Refund(Base, TimestampMixin):
+    __tablename__ = "refunds"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    payment_id: Mapped[str] = mapped_column(ForeignKey("payments.id"), index=True)
+    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"), index=True)
+    shift_id: Mapped[Optional[str]] = mapped_column(ForeignKey("shifts.id"), index=True)
+    amount: Mapped[float] = mapped_column(Money)
+    reason: Mapped[str] = mapped_column(Text)
+    approved_by: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    by_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    at: Mapped[datetime] = mapped_column(DateTime, default=lambda: now_almaty_ref())
+
+
+class CashOperation(Base, TimestampMixin):
+    __tablename__ = "cash_operations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    shift_id: Mapped[str] = mapped_column(ForeignKey("shifts.id"), index=True)
+    type: Mapped[str] = mapped_column(String(15))  # in|out|transfer_in|transfer_out|correction
+    amount: Mapped[float] = mapped_column(Money)
+    reason: Mapped[str] = mapped_column(String(200))
+    from_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    to_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    at: Mapped[datetime] = mapped_column(DateTime, default=lambda: now_almaty_ref())
+
+
+# ---------------- Финансовый учёт ----------------
+
+class FinancialAccount(Base, TimestampMixin):
+    __tablename__ = "financial_accounts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"))
+    name: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(15), default="cash")  # cash|bank|mobile|other
+    balance: Mapped[float] = mapped_column(Money, default=0)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class ExpenseCategory(Base, TimestampMixin):
+    __tablename__ = "expense_categories"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[Optional[str]] = mapped_column(ForeignKey("venues.id"))
+    name: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(15), default="opex")  # cogs|opex|payroll|tax|other
+    parent_id: Mapped[Optional[str]] = mapped_column(ForeignKey("expense_categories.id"))
+
+
+class FinTransaction(Base, TimestampMixin):
+    """Проводки управленческого учёта. Проведённые документы редактируются только через reverse+новая запись."""
+    __tablename__ = "fin_transactions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"), index=True)
+    account_id: Mapped[Optional[str]] = mapped_column(ForeignKey("financial_accounts.id"))
+    category_id: Mapped[Optional[str]] = mapped_column(ForeignKey("expense_categories.id"))
+    type: Mapped[str] = mapped_column(String(25), index=True)  # sale_revenue|cost|expense|advance|payout|debt_in|debt_out|transfer|correction|reverse
+    direction: Mapped[str] = mapped_column(String(4), default="in")  # in|out
+    amount: Mapped[float] = mapped_column(Money)
+    date: Mapped[datetime] = mapped_column(DateTime, index=True)
+    doc_ref: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+    counterparty: Mapped[Optional[str]] = mapped_column(String(150))
+    comment: Mapped[Optional[str]] = mapped_column(Text)
+    by_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    status: Mapped[str] = mapped_column(String(12), default="posted")  # draft|posted|reversed
+    reversed_of_id: Mapped[Optional[str]] = mapped_column(ForeignKey("fin_transactions.id"))
+
+
+class DebtRecord(Base, TimestampMixin):
+    __tablename__ = "debt_records"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"))
+    party: Mapped[str] = mapped_column(String(150))     # контрагент или сотрудник
+    kind: Mapped[str] = mapped_column(String(10), default="receivable")  # receivable|payable|advance
+    amount: Mapped[float] = mapped_column(Money)
+    closed_amount: Mapped[float] = mapped_column(Money, default=0)
+    date: Mapped[datetime] = mapped_column(DateTime, default=lambda: now_almaty_ref())
+    due_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    comment: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(12), default="open")  # open|partial|closed
+    by_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+
+
+# ---------------- Склад и закупки ----------------
+
+class Warehouse(Base, TimestampMixin):
+    __tablename__ = "warehouses"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"))
+    name: Mapped[str] = mapped_column(String(120))
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Product(Base, TimestampMixin):
+    __tablename__ = "products"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"), index=True)
+    warehouse_id: Mapped[Optional[str]] = mapped_column(ForeignKey("warehouses.id"))
+    article: Mapped[str] = mapped_column(String(40))
+    name: Mapped[str] = mapped_column(String(200))
+    base_uom: Mapped[str] = mapped_column(String(20), default="kg")       # базовая единица хранения
+    purchase_uom: Mapped[str] = mapped_column(String(20), default="pcs")  # единица закупки
+    coef: Mapped[float] = mapped_column(Qty, default=1)                   # 1 purchase_uom = coef base_uom
+    min_stock: Mapped[float] = mapped_column(Qty, default=0)
+    barcode: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+    last_purchase_price: Mapped[float] = mapped_column(Money, default=0)  # цена за purchase_uom
+    track_lots: Mapped[bool] = mapped_column(Boolean, default=False)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    __table_args__ = (UniqueConstraint("venue_id", "article"),)
+
+
+class StockBalance(Base, TimestampMixin):
+    __tablename__ = "stock_balances"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    warehouse_id: Mapped[str] = mapped_column(ForeignKey("warehouses.id"), index=True)
+    product_id: Mapped[str] = mapped_column(ForeignKey("products.id"), index=True)
+    quantity: Mapped[float] = mapped_column(Qty, default=0)
+    __table_args__ = (UniqueConstraint("warehouse_id", "product_id"),)
+
+
+class StockMovement(Base, TimestampMixin):
+    """Неизменяемый журнал складских операций (append-only)."""
+    __tablename__ = "stock_movements"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    warehouse_id: Mapped[str] = mapped_column(ForeignKey("warehouses.id"), index=True)
+    product_id: Mapped[str] = mapped_column(ForeignKey("products.id"), index=True)
+    qty_signed: Mapped[float] = mapped_column(Qty)
+    doc_type: Mapped[str] = mapped_column(String(20), index=True)  # receipt|sale|writeoff|transfer_in|transfer_out|inventory|return_to_supplier|production
+    doc_id: Mapped[Optional[str]] = mapped_column(String(32), index=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    unit_cost: Mapped[float] = mapped_column(Money, default=0)
+    negative_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+    lot_id: Mapped[Optional[str]] = mapped_column(ForeignKey("stock_lots.id"))
+    user_id: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    at: Mapped[datetime] = mapped_column(DateTime, default=lambda: now_almaty_ref(), index=True)
+
+
+class StockLot(Base, TimestampMixin):
+    __tablename__ = "stock_lots"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    product_id: Mapped[str] = mapped_column(ForeignKey("products.id"), index=True)
+    warehouse_id: Mapped[str] = mapped_column(ForeignKey("warehouses.id"))
+    qty_left: Mapped[float] = mapped_column(Qty, default=0)
+    unit_cost: Mapped[float] = mapped_column(Money, default=0)
+    expiry_date: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    receipt_id: Mapped[Optional[str]] = mapped_column(ForeignKey("goods_receipts.id"))
+
+
+class Supplier(Base, TimestampMixin):
+    __tablename__ = "suppliers"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"))
+    name: Mapped[str] = mapped_column(String(200))
+    contacts: Mapped[Optional[str]] = mapped_column(String(300))
+    requisites: Mapped[Optional[str]] = mapped_column(String(300))  # БИН и т.п.
+    terms: Mapped[Optional[str]] = mapped_column(Text)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+DOC_STATUSES = ["draft", "pending_approval", "approved", "posted", "cancelled"]
+
+
+class PurchaseOrder(Base, TimestampMixin):
+    __tablename__ = "purchase_orders"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"))
+    supplier_id: Mapped[str] = mapped_column(ForeignKey("suppliers.id"))
+    number: Mapped[str] = mapped_column(String(30), unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)
+    total: Mapped[float] = mapped_column(Money, default=0)
+    expected_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    comment: Mapped[Optional[str]] = mapped_column(Text)
+    created_by: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+    approved_by: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+
+
+class PurchaseOrderLine(Base, TimestampMixin):
+    __tablename__ = "purchase_order_lines"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    po_id: Mapped[str] = mapped_column(ForeignKey("purchase_orders.id"), index=True)
+    product_id: Mapped[str] = mapped_column(ForeignKey("products.id"))
+    ordered_qty: Mapped[float] = mapped_column(Qty)      # в purchase_uom
+    received_qty: Mapped[float] = mapped_column(Qty, default=0)
+    price: Mapped[float] = mapped_column(Money, default=0)
+
+
+class GoodsReceipt(Base, TimestampMixin):
+    __tablename__ = "goods_receipts"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"))
+    supplier_id: Mapped[str] = mapped_column(ForeignKey("suppliers.id"))
+    warehouse_id: Mapped[str] = mapped_column(ForeignKey("warehouses.id"))
+    po_id: Mapped[Optional[str]] = mapped_column(ForeignKey("purchase_orders.id"))
+    number: Mapped[str] = mapped_column(String(30), unique=True)
+    invoice_no: Mapped[Optional[str]] = mapped_column(String(60))
+    status: Mapped[str] = mapped_column(String(15), default="draft", index=True)  # draft|posted|cancelled
+    total: Mapped[float] = mapped_column(Money, default=0)
+    posted_by: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+
+
+class GoodsReceiptLine(Base, TimestampMixin):
+    __tablename__ = "goods_receipt_lines"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    receipt_id: Mapped[str] = mapped_column(ForeignKey("goods_receipts.id"), index=True)
+    product_id: Mapped[str] = mapped_column(ForeignKey("products.id"))
+    ordered_qty: Mapped[float] = mapped_column(Qty, default=0)   # если есть PO — заказано (purchase_uom)
+    received_qty: Mapped[float] = mapped_column(Qty)             # фактически принято (purchase_uom)
+    price: Mapped[float] = mapped_column(Money)                  # за purchase_uom
+    expiry_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    lot_note: Mapped[Optional[str]] = mapped_column(String(120))
+
+
+class WriteOff(Base, TimestampMixin):
+    __tablename__ = "writeoffs"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"))
+    warehouse_id: Mapped[str] = mapped_column(ForeignKey("warehouses.id"))
+    number: Mapped[str] = mapped_column(String(40), unique=True)
+    reason: Mapped[str] = mapped_column(String(30))              # spoilage|production|inventory_loss|other
+    reason_text: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(15), default="draft")
+    total_cost: Mapped[float] = mapped_column(Money, default=0)
+    lines = mapped_column(JSONText, default=list)                # [{product_id, qty}]
+    by_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+
+
+class Inventory(Base, TimestampMixin):
+    __tablename__ = "inventories"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    venue_id: Mapped[str] = mapped_column(ForeignKey("venues.id"))
+    warehouse_id: Mapped[str] = mapped_column(ForeignKey("warehouses.id"))
+    number: Mapped[str] = mapped_column(String(40), unique=True)
+    status: Mapped[str] = mapped_column(String(15), default="draft")
+    diff_total: Mapped[float] = mapped_column(Money, default=0)
+    by_user: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
+
+
+class InventoryLine(Base, TimestampMixin):
+    __tablename__ = "inventory_lines"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    inventory_id: Mapped[str] = mapped_column(ForeignKey("inventories.id"), index=True)
+    product_id: Mapped[str] = mapped_column(ForeignKey("products.id"))
+    expected_qty: Mapped[float] = mapped_column(Qty)
+    actual_qty: Mapped[float] = mapped_column(Qty)
+    diff_qty: Mapped[float] = mapped_column(Qty)
+    unit_cost: Mapped[float] = mapped_column(Money, default=0)
+
+
+Index("ix_mov_prod_wh", StockMovement.product_id, StockMovement.warehouse_id)
+Index("ix_pay_shift_method", Payment.shift_id, Payment.method)
