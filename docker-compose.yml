@@ -1,0 +1,60 @@
+# RestoCore — API + PostgreSQL. Локальный запуск для заведения; БД наружу не публикуется.
+# Запуск:  cp .env.example .env  (отредактируйте JWT_SECRET и пароли)  ->  docker compose up -d --build
+services:
+
+  db:
+    image: postgres:16-alpine
+    container_name: restocore-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: restocore
+      POSTGRES_USER: restocore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-restocore}
+    volumes:
+      - pgdata:/var/lib/postgresql/data          # постоянное хранилище данных
+    ports:
+      - "127.0.0.1:5432:5432"                    # только локальная сеть заведения, НЕ 0.0.0.0
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U restocore -d restocore"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: restocore-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy                # старт только после готовности PostgreSQL
+    environment:
+      DATABASE_URL: postgresql+psycopg2://restocore:${POSTGRES_PASSWORD:-restocore}@db:5432/restocore
+      JWT_SECRET: ${JWT_SECRET:?задайте JWT_SECRET в .env}
+      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-720}
+      TIMEZONE: Asia/Almaty
+      CURRENCY: KZT
+      BACKUP_DIR: /app/backups
+      UPLOAD_DIR: /app/uploads
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      SEED_DEMO: ${SEED_DEMO:-true}
+      RESTOCORE_ADMIN_PASSWORD: ${RESTOCORE_ADMIN_PASSWORD:-admin123}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      FISCAL_ADAPTER: ${FISCAL_ADAPTER:-stub}
+      TERMINAL_ADAPTER: ${TERMINAL_ADAPTER:-stub}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+    ports:
+      - "8000:8000"                               # доступ из локальной сети: http://<ip-сервера>:8000
+    volumes:
+      - backups:/app/backups                      # резервные копии переживают пересоздание контейнера
+      - uploads:/app/uploads                      # загруженные документы и фото (Z-отчёты, расходы)
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json;print(json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health'))['status'])\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  pgdata:
+  backups:
+  uploads:
